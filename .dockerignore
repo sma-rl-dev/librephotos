@@ -57,3 +57,6 @@ deploy/e2e
 # guard against accidents)
 import-*
 monorepo
+
+# tester-env runtime data (bind-mounted volumes, never part of build context)
+.tester-env-data

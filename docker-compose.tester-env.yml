@@ -1,0 +1,78 @@
+# tester-env overlay for the LibrePhotos prospect checkout.
+# Unified (no-proxy) deployment: Django serves the React frontend via
+# WhiteNoise on :8001, PostgreSQL runs as a pinned companion service.
+# Build context is the monorepo root (see deploy/docker/unified/Dockerfile).
+# NET_SUBNET is set by the tester-env CLI: the host's default Docker address
+# pools are exhausted, so each run gets an explicit free 10.x.x.0/24.
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${NET_SUBNET:?set by tester-env CLI}
+
+services:
+  app:
+    image: ${IMAGE_NAME:-tester-env-librephotos:dev}
+    build:
+      context: .
+      dockerfile: deploy/docker/unified/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8096}:8001"
+    environment:
+      - SERVE_FRONTEND=true
+      - SECRET_KEY=tester-env-librephotos-secret-key
+      - DB_BACKEND=postgresql
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=librephotos
+      - DB_USER=librephotos
+      - DB_PASS=librephotos
+      - ADMIN_USERNAME=admin
+      - ADMIN_EMAIL=admin@example.com
+      - ADMIN_PASSWORD=admin123
+      - ALLOW_UPLOAD=true
+      - MAPBOX_API_KEY=
+      - DEBUG=0
+      - WEB_CONCURRENCY=2
+      - BASE_LOGS=/logs
+      # ML feature flags off: scan jobs skip face/caption/scene/geocode work,
+      # so no multi-GB model downloads are triggered by scans. CLIP embeddings
+      # are not flag-gated and download on first photo scan (cached volume).
+      - FEATURE_VIDEO=false
+      - FEATURE_FACE_DETECTION=false
+      - FEATURE_FACE_CLUSTER=false
+      - FEATURE_IMAGE_CAPTIONING=false
+      - FEATURE_REVERSE_GEOCODING=false
+      - FEATURE_SCENE_CLASSIFICATION=false
+      - FEATURE_PROCESS_EMBEDDED_MEDIA=false
+    volumes:
+      - ${DATA_DIR}/media:/protected_media
+      # ML models (im2txt/places365/CLIP/etc., ~400MB) resolve under
+      # MEDIA_ROOT/data_models; keep them in the shared cache volume so
+      # reset+reseed does not re-download them every cycle.
+      - ${CACHE_DIR}/data_models:/protected_media/data_models
+      - ${DATA_DIR}/logs:/logs
+      - ${DATA_DIR}/scan:/data
+      # Model cache survives reset: resetting app data must not re-download
+      # the CLIP model on every scenario run.
+      - ${CACHE_DIR}:/root/.cache
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: pgautoupgrade/pgautoupgrade:17-bookworm
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=librephotos
+      - POSTGRES_PASSWORD=librephotos
+      - POSTGRES_DB=librephotos
+    volumes:
+      - ${DATA_DIR}/db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U librephotos -d librephotos -c 'SELECT 1;'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12

@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# LibrePhotos tester-env CLI (prospect checkout).
+# Unified image: Django serves the React frontend via WhiteNoise on :8001.
+# Usage: ./tester-env {deploy|reset|seed|verify|status|stop|logs|help} [--port N] [--run-id ID]
+#
+# Credentials: admin / admin123 (deterministic; created by container entrypoint
+# from ADMIN_* env and re-asserted by `seed`).
+
+RUN_ID="default"
+PORT="8096"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+# (baseline, patch-set) combos share an image. Manual invocations get :dev.
+IMAGE_NAME="${IMAGE_TAG:-tester-env-librephotos:dev}"
+
+refresh_names() {
+  local suffix=""
+  if [[ "${RUN_ID}" != "default" ]]; then
+    suffix="-${RUN_ID}"
+  fi
+  COMPOSE_PROJECT_NAME="tester-env-librephotos${suffix}"
+  export HOST_PORT="${PORT}"
+  export IMAGE_NAME
+  export DATA_DIR="${SCRIPT_DIR}/.tester-env-data/${RUN_ID}"
+  # Model cache is shared across runs: resetting app data must not force a
+  # multi-hundred-MB CLIP model re-download on every scenario run.
+  export CACHE_DIR="${SCRIPT_DIR}/.tester-env-data/cache"
+  # Host default Docker address pools are fully subnetted, so allocate an
+  # explicit per-run-id subnet (deterministic from RUN_ID, avoids collisions
+  # unless two run-ids hash identically).
+  local h a b
+  h=$(cksum <<<"${RUN_ID}" | awk '{print $1}')
+  a=$(( (h % 250) + 1 ))
+  b=$(( (h / 250 % 250) + 1 ))
+  export NET_SUBNET="10.${a}.${b}.0/24"
+  COMPOSE=(docker compose -p "${COMPOSE_PROJECT_NAME}" -f "${SCRIPT_DIR}/docker-compose.tester-env.yml")
+  URL="http://localhost:${PORT}"
+}
+
+cmd_deploy() {
+  mkdir -p "${DATA_DIR}/media" "${DATA_DIR}/logs" "${DATA_DIR}/scan" "${DATA_DIR}/db" "${CACHE_DIR}/data_models"
+  echo "==> Building image ${IMAGE_NAME} (build context: monorepo root)..."
+  "${COMPOSE[@]}" up --build -d
+
+  echo "==> Waiting for app to become ready at ${URL} ..."
+  local ok=0
+  for _ in $(seq 1 90); do
+    if curl -sf -o /dev/null "${URL}/api/healthz/"; then ok=1; break; fi
+    sleep 5
+  done
+  if [[ "${ok}" != "1" ]]; then
+    echo "==> FAIL: app did not become ready within 450s. Logs:"
+    "${COMPOSE[@]}" logs --tail 50 app
+    exit 1
+  fi
+  _verify_basic >/dev/null
+  echo "==> Deployment complete. URL: ${URL} Credentials: admin / admin123"
+}
+
+_obtain_jwt() {
+  curl -s -X POST "${URL}/api/auth/token/obtain/" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"admin123"}' |
+    python3 -c 'import sys,json;print(json.load(sys.stdin)["access"])'
+}
+
+# Seed photo inventory (deterministic; see SEED.md):
+# 12 tiny JPEGs, 3 per fixed date, distinct solid colors + drawn labels.
+# EXIF DateTimeOriginal/Make/Model written via Pillow inside the container.
+SEED_PHOTO_COUNT=12
+
+cmd_seed() {
+  require_running
+
+  echo "==> Seeding: ensuring deterministic admin user..."
+  "${COMPOSE[@]}" exec -T app python manage.py shell <<'EOF'
+import os
+from api.models import User
+
+u = os.environ["ADMIN_USERNAME"]
+p = os.environ["ADMIN_PASSWORD"]
+e = os.environ.get("ADMIN_EMAIL") or "admin@example.com"
+user, created = User.objects.get_or_create(username=u, defaults={"email": e})
+user.is_superuser = True
+user.is_staff = True
+user.email = e
+# Scan directory is the compose-mounted scan dir; a fresh admin starts
+# without one, and scans fail without it.
+user.scan_directory = "/data"
+user.set_password(p)
+user.save()
+print(f"seed: admin '{u}' {'created' if created else 'updated'} (scan_directory={user.scan_directory})")
+EOF
+
+  echo "==> Seeding: regenerating scan dir with ${SEED_PHOTO_COUNT} deterministic photos..."
+  # Clear contents only: removing the dir itself would break the container's
+  # active /data bind mount (stale inode -> ENOENT on file creation).
+  rm -f "${DATA_DIR}"/scan/*.jpg
+  "${COMPOSE[@]}" exec -T app python manage.py shell <<'EOF'
+import os
+from PIL import Image, ImageDraw, ImageFont
+
+PHOTOS = [
+    # (date, name, hex, time) -> file <date>_<name>.jpg
+    ("2025-11-02", "Crimson",  "#DC143C", "10:15:00"),
+    ("2025-11-02", "Amber",    "#FFBF00", "11:30:00"),
+    ("2025-11-02", "Teal",     "#008080", "12:45:00"),
+    ("2026-01-17", "Cobalt",   "#0047AB", "09:20:00"),
+    ("2026-01-17", "Emerald",  "#50C878", "10:35:00"),
+    ("2026-01-17", "Lavender", "#B57EDC", "14:10:00"),
+    ("2026-03-09", "Marigold", "#EAA221", "08:05:00"),
+    ("2026-03-09", "Cerulean", "#2A52BE", "13:25:00"),
+    ("2026-03-09", "Coral",    "#FF7F50", "16:40:00"),
+    ("2026-05-24", "Olive",    "#808000", "07:55:00"),
+    ("2026-05-24", "Plum",     "#8E4585", "15:05:00"),
+    ("2026-05-24", "Slate",    "#708090", "18:30:00"),
+]
+OUT = "/data"
+os.makedirs(OUT, exist_ok=True)
+try:
+    font = ImageFont.load_default(size=34)
+except TypeError:
+    font = ImageFont.load_default()
+
+for date, name, hexcolor, time in PHOTOS:
+    img = Image.new("RGB", (400, 300), hexcolor)
+    d = ImageDraw.Draw(img)
+    d.text((20, 130), name, fill="white", font=font,
+           stroke_width=2, stroke_fill="black")
+    d.text((20, 175), date, fill="white", font=font,
+           stroke_width=2, stroke_fill="black")
+    exif = Image.Exif()
+    exif[271] = "LibrePhotos"                     # Make
+    exif[272] = "TesterCam One"                   # Model
+    exif[306] = f"{date.replace('-', ':')} {time}"   # DateTime
+    exif[36867] = f"{date.replace('-', ':')} {time}"  # DateTimeOriginal
+    img.save(os.path.join(OUT, f"{date}_{name.lower()}.jpg"),
+             "JPEG", quality=85, exif=exif)
+print(f"seed: generated {len(PHOTOS)} photos in {OUT}")
+EOF
+
+  echo "==> Seeding: wiping existing photo rows (deterministic re-scan)..."
+  "${COMPOSE[@]}" exec -T app python manage.py shell <<'EOF'
+from api.models import Photo
+n = Photo.objects.count()
+Photo.objects.all().delete()
+print(f"seed: removed {n} existing photo rows")
+EOF
+
+  echo "==> Seeding: obtaining admin JWT..."
+  local token
+  token=$(_obtain_jwt)
+  if [[ -z "${token}" ]]; then
+    echo "==> FAIL: could not obtain admin JWT."
+    exit 1
+  fi
+
+  echo "==> Seeding: triggering library scan (POST /api/scanphotos)..."
+  local scan_resp
+  scan_resp=$(curl -s -X POST "${URL}/api/scanphotos/" \
+    -H "Authorization: Bearer ${token}" 2>/dev/null || true)
+  if ! grep -q '"status": *true' <<<"${scan_resp}"; then
+    echo "==> FAIL: scan trigger failed: ${scan_resp}"
+    exit 1
+  fi
+
+  echo "==> Seeding: waiting for scan to finish (${SEED_PHOTO_COUNT} photos visible via API)..."
+  local count=""
+  for _ in $(seq 1 120); do
+    count=$(curl -s "${URL}/api/photos/?page_size=1" \
+      -H "Authorization: Bearer ${token}" |
+      python3 -c 'import sys,json;print(json.load(sys.stdin).get("count", 0))' 2>/dev/null || echo 0)
+    if [[ "${count}" == "${SEED_PHOTO_COUNT}" ]]; then
+      break
+    fi
+    sleep 5
+  done
+  if [[ "${count}" != "${SEED_PHOTO_COUNT}" ]]; then
+    echo "==> FAIL: photo count is ${count:-unknown}, expected ${SEED_PHOTO_COUNT}."
+    exit 1
+  fi
+
+  echo "==> Seeding: creating/reasserting user albums via API..."
+  # Album spec: "Title|file1.jpg,file2.jpg,..." (files sorted by scan order)
+  local album_specs=(
+    "Garden Favorites|2025-11-02_crimson.jpg,2026-03-09_coral.jpg,2026-05-24_olive.jpg,2026-05-24_plum.jpg"
+    "Winter Trip|2026-01-17_cobalt.jpg,2026-01-17_emerald.jpg,2026-01-17_lavender.jpg"
+  )
+  local photo_json
+  photo_json=$(curl -s "${URL}/api/photos/?page_size=100" \
+    -H "Authorization: Bearer ${token}")
+  for spec in "${album_specs[@]}"; do
+    local title="${spec%%|*}" files="${spec#*|}"
+    local album_id
+    album_id=$(curl -s "${URL}/api/albums/user/?page_size=100" \
+      -H "Authorization: Bearer ${token}" |
+      python3 -c "
+import sys, json
+title = ${title@Q}
+d = json.load(sys.stdin)
+m = [a for a in d['results'] if a['title'] == title]
+print(m[0]['id'] if m else '')
+")
+    if [[ -z "${album_id}" ]]; then
+      album_id=$(curl -s -X POST "${URL}/api/albums/user/" \
+        -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+        -d "{\"title\": \"${title}\"}" |
+        python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+      echo "    created album '${title}' (${album_id})"
+    else
+      echo "    album '${title}' already exists (${album_id})"
+    fi
+    curl -s -X PATCH "${URL}/api/albums/user/edit/${album_id}/" \
+      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+      -d "$(python3 -c "
+import json
+photo_json = json.loads(${photo_json@Q})
+files = ${files@Q}.split(',')
+by_name = {p['image_path'][0].rsplit('/', 1)[-1]: p['id'] for p in photo_json['results']}
+ids = [by_name[f] for f in files]
+print(json.dumps({'photos': ids, 'cover_photo': ids[0]}))
+")" >/dev/null
+  done
+
+  echo "==> Seed complete: ${SEED_PHOTO_COUNT} photos (4 EXIF dates), 2 user albums."
+}
+
+_verify_basic() {
+  local http_code html
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" "${URL}/" 2>/dev/null || true)
+  html=$(curl -s "${URL}/" 2>/dev/null || true)
+  case "${http_code}" in
+    200) ;;
+    *) echo "==> FAIL: app root not responding (HTTP ${http_code})."; exit 1 ;;
+  esac
+  if ! grep -qi "librephotos" <<<"${html}"; then
+    echo "==> FAIL: root page HTML does not look like LibrePhotos."
+    exit 1
+  fi
+  echo "==> App responds (HTTP ${http_code}, LibrePhotos HTML)."
+
+  local token_resp
+  token_resp=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${URL}/api/auth/token/obtain/" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"admin123"}' 2>/dev/null || true)
+  if [[ "${token_resp}" != "200" ]]; then
+    echo "==> FAIL: admin login failed (HTTP ${token_resp})."
+    exit 1
+  fi
+  echo "==> Admin login verified (POST /api/auth/token/obtain/ -> 200)."
+}
+
+cmd_verify() {
+  require_running
+  _verify_basic
+
+  echo "==> Verifying seeded data via API..."
+  local token photos_count
+  token=$(_obtain_jwt)
+  photos_count=$(curl -s "${URL}/api/photos/?page_size=1" \
+    -H "Authorization: Bearer ${token}" |
+    python3 -c 'import sys,json;print(json.load(sys.stdin).get("count", 0))' 2>/dev/null || echo 0)
+  if [[ "${photos_count}" -lt "${SEED_PHOTO_COUNT}" ]]; then
+    echo "==> FAIL: photo count is ${photos_count}, expected >= ${SEED_PHOTO_COUNT} (run './tester-env seed')."
+    exit 1
+  fi
+  echo "==> Photo count verified: ${photos_count} (expected >= ${SEED_PHOTO_COUNT})."
+
+  local albums_json missing=0
+  albums_json=$(curl -s "${URL}/api/albums/user/?page_size=100" \
+    -H "Authorization: Bearer ${token}")
+  for expected_album in "Garden Favorites" "Winter Trip"; do
+    if python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+sys.exit(0 if any(a['title'] == '${expected_album}' for a in d['results']) else 1)
+" <<<"${albums_json}"; then
+      echo "==> Album verified: '${expected_album}' present."
+    else
+      echo "==> FAIL: album '${expected_album}' missing (run './tester-env seed')."
+      missing=1
+    fi
+  done
+  if [[ "${missing}" != "0" ]]; then
+    exit 1
+  fi
+  echo "==> Verify PASSED: ${URL} (admin / admin123; ${photos_count} photos, 2 user albums)"
+}
+
+cmd_reset() {
+  echo "==> Resetting run '${RUN_ID}' (containers + data)..."
+  "${COMPOSE[@]}" down -v 2>/dev/null || true
+  # The container writes root-owned files (thumbnails, ML models) the host
+  # user cannot delete; remove the data dir through a short-lived container.
+  docker run --rm --entrypoint /bin/sh \
+    -v "${SCRIPT_DIR}/.tester-env-data:/runs" "${IMAGE_NAME}" \
+    -c "rm -rf /runs/${RUN_ID}" >/dev/null 2>&1 ||
+    rm -rf "${DATA_DIR}" 2>/dev/null || true
+  echo "==> Reset complete. Data dir removed: ${DATA_DIR} (model cache kept: ${CACHE_DIR})"
+}
+
+cmd_stop() {
+  "${COMPOSE[@]}" down 2>/dev/null || true
+  echo "==> Stopped (data preserved in ${DATA_DIR})."
+}
+
+cmd_logs() {
+  "${COMPOSE[@]}" logs -f --tail 100 2>/dev/null || true
+}
+
+cmd_status() {
+  local running
+  running=$("${COMPOSE[@]}" ps --format "{{.Name}} {{.Status}}" 2>/dev/null || true)
+  if [[ -n "${running}" ]]; then
+    echo "Status: RUNNING (${COMPOSE_PROJECT_NAME})"
+    echo "URL: ${URL}"
+    echo "${running}"
+  else
+    echo "Status: NOT RUNNING (${COMPOSE_PROJECT_NAME})"
+  fi
+}
+
+require_running() {
+  if ! "${COMPOSE[@]}" ps --status running --services 2>/dev/null | grep -q '^app$'; then
+    echo "==> FAIL: app container not running. Run './tester-env deploy' first."
+    exit 1
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+LibrePhotos tester-env CLI
+
+Usage: ./tester-env <command> [--port <port>] [--run-id <id>]
+
+Commands:
+  deploy    Build unified image, start app+db, wait for readiness, verify login
+  seed      Deterministic data: admin + 12 photos (4 EXIF dates) + 2 albums
+            ("Garden Favorites", "Winter Trip"); blocks until scan completes
+  verify    Assert app responds, admin login, photo count >= 12, albums present
+  reset     Stop and remove containers + per-run data dir (model cache kept)
+  stop      Stop containers (data preserved)
+  logs      Tail app+db logs
+  status    Show running state and URL
+  help      Show this help
+
+Options:
+  --port <port>    Host port (default 8096)
+  --run-id <id>    Isolate compose project and data dir (default: default)
+
+Env:
+  IMAGE_TAG        App image name/tag override (scripts/rl-env contract).
+                   Default: tester-env-librephotos:dev
+
+Credentials: admin / admin123
+Data: .tester-env-data/<run-id>/{db,media,logs,scan}; shared .tester-env-data/cache
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) PORT="$2"; shift 2 ;;
+      --run-id) RUN_ID="$2"; shift 2 ;;
+      --help|-h) cmd_help; exit 0 ;;
+      *) echo "Unknown option: $1"; cmd_help; exit 1 ;;
+    esac
+  done
+  refresh_names
+  case "${cmd}" in
+    deploy) cmd_deploy ;; seed) cmd_seed ;; verify) cmd_verify ;; reset) cmd_reset ;;
+    stop) cmd_stop ;; logs) cmd_logs ;; status) cmd_status ;; help|--help|-h) cmd_help ;;
+    *) echo "Unknown command: ${cmd}"; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"
