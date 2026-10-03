@@ -19,28 +19,37 @@ Deterministic data population for `./tester-env` in this prospect checkout
   are visible via the API. Measured: full cycle ~63s (deploy ~40s build-cached,
   seed ~11s including scan wait, verify <1s).
 - **Verify** exits nonzero unless: app root responds, admin login works,
-  photo count >= 12, and both albums exist.
+  photo count >= 14, both albums exist, and the AA-Twin/ZZ-Twin pair shares
+  one identical EXIF timestamp.
 
 ## Seeded State
 
 1. **Admin user** with `scan_directory=/data` (a fresh admin starts without a
    scan directory; scans fail without it).
-2. **12 photos** in the library, 3 per fixed capture date, distinct solid
-   colors with drawn labels. Generated inside the app container with Pillow
+2. **14 photos** in the library: 12 base photos, 3 per fixed capture date,
+   distinct solid colors with drawn labels, plus the AA-Twin/ZZ-Twin
+   same-timestamp pair. Generated inside the app container with Pillow
    (400x300 JPEG q85, EXIF Make/Model/DateTime/DateTimeOriginal) into `/data`
    (host: `.tester-env-data/<run-id>/scan/`).
 
    | Date       | Files                                                      |
    |------------|------------------------------------------------------------|
    | 2025-11-02 | crimson (#DC143C), amber (#FFBF00), teal (#008080)          |
-   | 2026-01-17 | cobalt (#0047AB), emerald (#50C878), lavender (#B57EDC)     |
+   | 2026-01-17 | cobalt (#0047AB), emerald (#50C878), lavender (#B57EDC), AA-Twin (#FF8C00) + ZZ-Twin (#4B0082) sharing EXIF `2026:01:17 12:00:00` |
    | 2026-03-09 | marigold (#EAA221), cerulean (#2A52BE), coral (#FF7F50)     |
    | 2026-05-24 | olive (#808000), plum (#8E4585), slate (#708090)            |
 
-   Filenames: `<date>_<color>.jpg` (e.g. `2025-11-02_crimson.jpg`). Each image
+   Filenames: `<date>_<color>.jpg` (e.g. `2025-11-02_crimson.jpg`), plus
+   `2026-01-17_aa-twin.jpg` / `2026-01-17_zz-twin.jpg` (alphabetically
+   ordered, visually distinguishable solid colors + labels). Each image
    draws the color name and date as white text with black outline. Camera EXIF:
-   Make=LibrePhotos, Model=TesterCam One. All 12 photos have EXIF timestamps
-   (4 distinct date groups visible in the UI timeline).
+   Make=LibrePhotos, Model=TesterCam One. All 14 photos have EXIF timestamps
+   (4 distinct date groups visible in the UI timeline); the twin pair shares
+   one identical DateTimeOriginal (`2026:01:17 12:00:00`) inside the 2026-01-17
+   day group, so their on-screen order is decided by the filename tiebreaker
+   (`order_by("-exif_timestamp", "main_file__path")` in AlbumDateViewSet).
+   The twins belong to no user album (Garden Favorites keeps 4 photos,
+   Winter Trip keeps 3).
 3. **2 user albums** (owned by admin):
    - `Garden Favorites` — 4 photos: crimson, coral, olive, plum (cover: crimson)
    - `Winter Trip` — 3 photos: cobalt, emerald, lavender (cover: cobalt)
@@ -53,7 +62,7 @@ Auth: `POST /api/auth/token/obtain/` `{"username":"admin","password":"admin123"}
 Seed:
 - `POST /api/scanphotos/` → `{"status": true, "job_id": ...}` (async django-q2
   scan of `/data`; seed polls until done)
-- `GET /api/photos/?page_size=1` → `{"count": N}` polled until N == 12
+- `GET /api/photos/?page_size=1` → `{"count": N}` polled until N == 14
 - `GET /api/photos/?page_size=100` → results `id` (UUID pk) + `image_path[0]`
   (filename → UUID mapping for album membership)
 - `POST /api/albums/user/` `{"title": "..."}` → 201, response `id` (album UUID)
@@ -61,8 +70,10 @@ Seed:
   `{"photos": ["<uuid>", ...], "cover_photo": "<uuid>"}` (AlbumUserEditSerializer)
 
 Verify:
-- `GET /api/photos/?page_size=1` → count >= 12
+- `GET /api/photos/?page_size=1` → count >= 14
 - `GET /api/albums/user/?page_size=100` → titles include both albums
+- `GET /api/photos/?page_size=100` → both `2026-01-17_aa-twin.jpg` and
+  `2026-01-17_zz-twin.jpg` present with equal `exif_timestamp`
 
 Additional non-CLI maintenance calls used while building the seed:
 - `POST /api/deletemissingphotos` (unused in seed; seed wipes `Photo` rows via
@@ -81,7 +92,7 @@ Additional non-CLI maintenance calls used while building the seed:
   `docker compose exec app python manage.py shell` (Pillow in-container; host
   ImageMagick 6 cannot reliably write EXIF and no exiftool on host).
 - Seed wipes existing `Photo` rows before rescanning, so a second `seed` run
-  converges to exactly 12 photos (no duplicates) — idempotency proven.
+  converges to exactly 14 photos (no duplicates) — idempotency proven.
 - ML model files (~408MB: im2txt, places365, resnet18, CLIP embeddings) resolve
   under `MEDIA_ROOT/data_models`; they are bind-mounted from the shared cache
   (`${CACHE_DIR}/data_models`) so reset+reseed does not re-download them.

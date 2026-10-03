@@ -68,9 +68,11 @@ _obtain_jwt() {
 }
 
 # Seed photo inventory (deterministic; see SEED.md):
-# 12 tiny JPEGs, 3 per fixed date, distinct solid colors + drawn labels.
-# EXIF DateTimeOriginal/Make/Model written via Pillow inside the container.
-SEED_PHOTO_COUNT=12
+# 14 tiny JPEGs: 12 base photos (3 per fixed date, distinct solid colors +
+# drawn labels) plus the AA-Twin/ZZ-Twin pair sharing one identical EXIF
+# timestamp on 2026-01-17 (filename-tiebreaker oracle). All EXIF
+# DateTimeOriginal/Make/Model written via Pillow inside the container.
+SEED_PHOTO_COUNT=14
 
 cmd_seed() {
   require_running
@@ -111,6 +113,11 @@ PHOTOS = [
     ("2026-01-17", "Cobalt",   "#0047AB", "09:20:00"),
     ("2026-01-17", "Emerald",  "#50C878", "10:35:00"),
     ("2026-01-17", "Lavender", "#B57EDC", "14:10:00"),
+    # Same-timestamp twin pair (identical EXIF DateTimeOriginal 12:00:00 on
+    # 2026-01-17; filenames alphabetically ordered aa-twin < zz-twin;
+    # visually distinguishable solid colors + labels). In no user album.
+    ("2026-01-17", "AA-Twin",  "#FF8C00", "12:00:00"),
+    ("2026-01-17", "ZZ-Twin",  "#4B0082", "12:00:00"),
     ("2026-03-09", "Marigold", "#EAA221", "08:05:00"),
     ("2026-03-09", "Cerulean", "#2A52BE", "13:25:00"),
     ("2026-03-09", "Coral",    "#FF7F50", "16:40:00"),
@@ -225,7 +232,7 @@ print(json.dumps({'photos': ids, 'cover_photo': ids[0]}))
 ")" >/dev/null
   done
 
-  echo "==> Seed complete: ${SEED_PHOTO_COUNT} photos (4 EXIF dates), 2 user albums."
+  echo "==> Seed complete: ${SEED_PHOTO_COUNT} photos (4 EXIF dates, incl. AA-Twin/ZZ-Twin same-timestamp pair), 2 user albums."
 }
 
 _verify_basic() {
@@ -287,7 +294,28 @@ sys.exit(0 if any(a['title'] == '${expected_album}' for a in d['results']) else 
   if [[ "${missing}" != "0" ]]; then
     exit 1
   fi
-  echo "==> Verify PASSED: ${URL} (admin / admin123; ${photos_count} photos, 2 user albums)"
+
+  echo "==> Verifying same-timestamp twin pair (2026-01-17_aa-twin.jpg / 2026-01-17_zz-twin.jpg)..."
+  local photos_json
+  photos_json=$(curl -s "${URL}/api/photos/?page_size=100" \
+    -H "Authorization: Bearer ${token}")
+  if python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+by_name = {p['image_path'][0].rsplit('/', 1)[-1]: p for p in d['results']}
+for f in ('2026-01-17_aa-twin.jpg', '2026-01-17_zz-twin.jpg'):
+    assert f in by_name, f'missing {f}'
+a, b = by_name['2026-01-17_aa-twin.jpg'], by_name['2026-01-17_zz-twin.jpg']
+assert a.get('exif_timestamp') and a['exif_timestamp'] == b['exif_timestamp'], (
+    f\"timestamps differ: {a.get('exif_timestamp')} vs {b.get('exif_timestamp')}\")
+print('twin timestamps:', a['exif_timestamp'])
+" <<<"${photos_json}"; then
+    echo "==> Twin pair verified: identical EXIF timestamp, alphabetical filenames."
+  else
+    echo "==> FAIL: same-timestamp twin pair check failed (run './tester-env seed')."
+    exit 1
+  fi
+  echo "==> Verify PASSED: ${URL} (admin / admin123; ${photos_count} photos, 2 user albums, AA-Twin/ZZ-Twin pair)"
 }
 
 cmd_reset() {
@@ -338,9 +366,11 @@ Usage: ./tester-env <command> [--port <port>] [--run-id <id>]
 
 Commands:
   deploy    Build unified image, start app+db, wait for readiness, verify login
-  seed      Deterministic data: admin + 12 photos (4 EXIF dates) + 2 albums
+  seed      Deterministic data: admin + 14 photos (4 EXIF dates, incl.
+            same-timestamp AA-Twin/ZZ-Twin pair) + 2 albums
             ("Garden Favorites", "Winter Trip"); blocks until scan completes
-  verify    Assert app responds, admin login, photo count >= 12, albums present
+  verify    Assert app responds, admin login, photo count >= 14, albums present,
+            twin pair shares one EXIF timestamp
   reset     Stop and remove containers + per-run data dir (model cache kept)
   stop      Stop containers (data preserved)
   logs      Tail app+db logs
