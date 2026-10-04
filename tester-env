@@ -325,7 +325,7 @@ cmd_reset() {
   # user cannot delete; remove the data dir through a short-lived container.
   docker run --rm --entrypoint /bin/sh \
     -v "${SCRIPT_DIR}/.tester-env-data:/runs" "${IMAGE_NAME}" \
-    -c "rm -rf /runs/${RUN_ID}; if [ -d /runs/cache ]; then chown -R $(id -u):$(id -g) /runs/cache; fi" >/dev/null 2>&1 ||
+    -c "rm -rf /runs/${RUN_ID}; chown $(id -u):$(id -g) /runs; if [ -d /runs/cache ]; then chown -R $(id -u):$(id -g) /runs/cache; fi" >/dev/null 2>&1 ||
     rm -rf "${DATA_DIR}" 2>/dev/null || true
   echo "==> Reset complete. Data dir removed: ${DATA_DIR} (model cache kept: ${CACHE_DIR})"
 }
