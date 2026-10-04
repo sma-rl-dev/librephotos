@@ -73,6 +73,11 @@ _obtain_jwt() {
 # timestamp on 2026-01-17 (filename-tiebreaker oracle). All EXIF
 # DateTimeOriginal/Make/Model written via Pillow inside the container.
 SEED_PHOTO_COUNT=14
+# All seeded JPEGs live under this subdirectory of the scan root so the normal
+# recursive scanner and the disk-backed Albums > Folders view find a folder
+# album. Deterministic and seed-owned.
+SEED_FOLDER_NAME="Library"
+SEED_OUT="/data/${SEED_FOLDER_NAME}"
 
 cmd_seed() {
   require_running
@@ -98,9 +103,11 @@ print(f"seed: admin '{u}' {'created' if created else 'updated'} (scan_directory=
 EOF
 
   echo "==> Seeding: regenerating scan dir with ${SEED_PHOTO_COUNT} deterministic photos..."
-  # Clear contents only: removing the dir itself would break the container's
-  # active /data bind mount (stale inode -> ENOENT on file creation).
-  rm -f "${DATA_DIR}"/scan/*.jpg
+  # Seed-owned cleanup, run inside the app container so root-owned files from
+  # a prior seed can be removed deterministically. Strictly scoped to the scan
+  # root's seed JPEGs and the seed's own Library folder. The scan root itself
+  # (the active /data bind mount) is never removed.
+  "${COMPOSE[@]}" exec -T app sh -c "rm -f /data/*.jpg && rm -rf /data/${SEED_FOLDER_NAME}"
   "${COMPOSE[@]}" exec -T app python manage.py shell <<'EOF'
 import os
 from PIL import Image, ImageDraw, ImageFont
@@ -125,7 +132,7 @@ PHOTOS = [
     ("2026-05-24", "Plum",     "#8E4585", "15:05:00"),
     ("2026-05-24", "Slate",    "#708090", "18:30:00"),
 ]
-OUT = "/data"
+OUT = "/data/Library"
 os.makedirs(OUT, exist_ok=True)
 try:
     font = ImageFont.load_default(size=34)
@@ -232,7 +239,7 @@ print(json.dumps({'photos': ids, 'cover_photo': ids[0]}))
 ")" >/dev/null
   done
 
-  echo "==> Seed complete: ${SEED_PHOTO_COUNT} photos (4 EXIF dates, incl. AA-Twin/ZZ-Twin same-timestamp pair), 2 user albums."
+  echo "==> Seed complete: ${SEED_PHOTO_COUNT} photos under ${SEED_OUT} (4 EXIF dates, incl. AA-Twin/ZZ-Twin same-timestamp pair), 2 user albums."
 }
 
 _verify_basic() {
@@ -295,6 +302,29 @@ sys.exit(0 if any(a['title'] == '${expected_album}' for a in d['results']) else 
     exit 1
   fi
 
+  echo "==> Verifying folder album via API (/api/folders/subfolders/)..."
+  local folders_json
+  folders_json=$(curl -s "${URL}/api/folders/subfolders/" \
+    -H "Authorization: Bearer ${token}")
+  if python3 -c "
+import sys, json
+expected_name = '${SEED_FOLDER_NAME}'
+expected_count = ${SEED_PHOTO_COUNT}
+d = json.load(sys.stdin)
+subs = d.get('subfolders') or []
+match = [s for s in subs if s.get('name') == expected_name and s.get('photo_count') == expected_count]
+if not match:
+    raise SystemExit(
+        f'no folder {expected_name!r} with photo_count {expected_count}; got '
+        + repr([(s.get('name'), s.get('photo_count')) for s in subs]))
+print('folder album:', match[0]['path'], match[0]['photo_count'])
+" <<<"${folders_json}"; then
+    echo "==> Folder album verified: '${SEED_FOLDER_NAME}' lists ${SEED_PHOTO_COUNT} photos."
+  else
+    echo "==> FAIL: folder album '${SEED_FOLDER_NAME}' with ${SEED_PHOTO_COUNT} photos not found (run './tester-env seed')."
+    exit 1
+  fi
+
   echo "==> Verifying same-timestamp twin pair (2026-01-17_aa-twin.jpg / 2026-01-17_zz-twin.jpg)..."
   local photos_json
   photos_json=$(curl -s "${URL}/api/photos/?page_size=100" \
@@ -315,7 +345,7 @@ print('twin timestamps:', a['exif_timestamp'])
     echo "==> FAIL: same-timestamp twin pair check failed (run './tester-env seed')."
     exit 1
   fi
-  echo "==> Verify PASSED: ${URL} (admin / admin123; ${photos_count} photos, 2 user albums, AA-Twin/ZZ-Twin pair)"
+  echo "==> Verify PASSED: ${URL} (admin / admin123; ${photos_count} photos, 2 user albums, folder '${SEED_FOLDER_NAME}' ${SEED_PHOTO_COUNT}, AA-Twin/ZZ-Twin pair)"
 }
 
 cmd_reset() {

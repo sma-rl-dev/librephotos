@@ -19,8 +19,8 @@ Deterministic data population for `./tester-env` in this prospect checkout
   are visible via the API. Measured: full cycle ~63s (deploy ~40s build-cached,
   seed ~11s including scan wait, verify <1s).
 - **Verify** exits nonzero unless: app root responds, admin login works,
-  photo count >= 14, both albums exist, and the AA-Twin/ZZ-Twin pair shares
-  one identical EXIF timestamp.
+  photo count >= 14, both albums exist, the folder album `Library` lists all
+  14 photos, and the AA-Twin/ZZ-Twin pair shares one identical EXIF timestamp.
 
 ## Seeded State
 
@@ -29,8 +29,10 @@ Deterministic data population for `./tester-env` in this prospect checkout
 2. **14 photos** in the library: 12 base photos, 3 per fixed capture date,
    distinct solid colors with drawn labels, plus the AA-Twin/ZZ-Twin
    same-timestamp pair. Generated inside the app container with Pillow
-   (400x300 JPEG q85, EXIF Make/Model/DateTime/DateTimeOriginal) into `/data`
-   (host: `.tester-env-data/<run-id>/scan/`).
+   (400x300 JPEG q85, EXIF Make/Model/DateTime/DateTimeOriginal) into
+   `/data/Library` (host: `.tester-env-data/<run-id>/scan/Library/`), so the
+   normal recursive scanner exposes one disk-backed folder album named
+   `Library` with all 14 photos.
 
    | Date       | Files                                                      |
    |------------|------------------------------------------------------------|
@@ -72,6 +74,8 @@ Seed:
 Verify:
 - `GET /api/photos/?page_size=1` → count >= 14
 - `GET /api/albums/user/?page_size=100` → titles include both albums
+- `GET /api/folders/subfolders/` → a folder entry `Library` with
+  `photo_count` 14 (disk-backed folder album, admin DATA_ROOT `/data`)
 - `GET /api/photos/?page_size=100` → both `2026-01-17_aa-twin.jpg` and
   `2026-01-17_zz-twin.jpg` present with equal `exif_timestamp`
 
